@@ -31,11 +31,11 @@ jobs:
           - arch: linux/amd64
             runner: ubuntu-latest
             tag: amd64
-             dockerfile: ./docker/ascend/Dockerfile.ascend_9.0.0_a2.x86
+            dockerfile: ./docker/ascend/Dockerfile.ascend_9.0.0_a2.x86
           - arch: linux/arm64
             runner: ubuntu-22.04-arm
             tag: arm64
-             dockerfile: ./docker/ascend/Dockerfile.ascend_9.0.0_a2.arm
+            dockerfile: ./docker/ascend/Dockerfile.ascend_9.0.0_a2.arm
 
     steps:
       - name: Free disk space
