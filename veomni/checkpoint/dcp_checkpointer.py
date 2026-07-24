@@ -52,6 +52,35 @@ _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 _EXTRA_STATE_DIR = "extra_state"
 
 
+class _ModelStrictLoadPlanner(DefaultLoadPlanner):
+    """Allow partial optimizer state while requiring a complete full-model DCP."""
+
+    def __init__(self, strict_model: bool):
+        super().__init__(allow_partial_load=True)
+        self.strict_model = strict_model
+
+    def create_local_plan(self):
+        plan = super().create_local_plan()
+        if not self.strict_model:
+            return plan
+
+        assert self.metadata is not None
+        missing_model_keys = sorted(
+            key
+            for key, path in self.mappings.items()
+            if path and path[0] == "model" and key not in self.metadata.state_dict_metadata
+        )
+        if missing_model_keys:
+            preview = ", ".join(missing_model_keys[:10])
+            suffix = " ..." if len(missing_model_keys) > 10 else ""
+            raise RuntimeError(
+                f"DCP is missing {len(missing_model_keys)} model key(s) required for a full-model resume: "
+                f"{preview}{suffix}"
+            )
+
+        return plan
+
+
 def _validate_extra_parallel_meshes(parallel_state) -> None:
     """Fail-fast precondition for ExtraParallel state dict preprocessing.
 
@@ -170,13 +199,13 @@ class ModelState(Stateful):
             (already populated from ``model_path``) base params are left untouched.
     """
 
-    def __init__(self, model, trainable_only: bool = False):
+    def __init__(self, model, trainable_only: bool = False, parallel_state=None):
         self.model = model
         self.trainable_only = trainable_only
 
         # Determine whether this is ExtraParallel+FSDP2 case
         # If so, we need to restore Para(e.g. EP)-dim before saving to DCP
-        self.parallel_state = get_parallel_state()
+        self.parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
         self.extra_parallel_fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
         self.should_extra_parallel_aware = (
             self.extra_parallel_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
@@ -236,15 +265,15 @@ class OptimizerState(Stateful):
     equivalent to what AdamW would create on the next ``step()`` call.
 
     Note: ``allow_partial_load`` is set globally on the DCP planner (it
-    cannot be scoped to optimizer-only).  Model-weight integrity is still
-    enforced by ``set_model_state_dict(strict=True)`` inside
-    ``ModelState.load_state_dict`` for non-LoRA loads.
+    cannot be scoped to optimizer-only). ``_ModelStrictLoadPlanner`` therefore
+    validates model-key completeness from checkpoint metadata before loading a
+    non-LoRA full-model DCP.
     """
 
-    def __init__(self, model, optimizer):
+    def __init__(self, model, optimizer, parallel_state=None):
         self.model = model
         self.optimizer = optimizer
-        self.parallel_state = get_parallel_state()
+        self.parallel_state = parallel_state if parallel_state is not None else get_parallel_state()
         self.extra_parallel_fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
         self.should_extra_parallel_aware = (
             self.extra_parallel_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
@@ -280,11 +309,19 @@ class OptimizerState(Stateful):
             restore_optimizer_param_group_defaults(self.optimizer)
             return
 
-        # Single torch optimizer
+        # Single torch optimizer.
+        # ``strict=False`` matches the DCP planner's allow_partial_load intent:
+        # params that never received a gradient (and thus have no saved Adam
+        # state) keep the default-initialized state that
+        # ``set_optimizer_state_dict`` / ``_init_optim_state`` already created.
+        # Torch 2.11+ raises under the default strict=True when any
+        # requires_grad param is missing from the checkpoint (DeepSeek-V4
+        # indexer ``position_bias`` is one such case on short toy runs).
         set_optimizer_state_dict(
             model=self.model,
             optimizers=self.optimizer,
             optim_state_dict=optim_state_from_dcp_load,
+            options=StateDictOptions(strict=False),
         )
         restore_optimizer_param_group_defaults(self.optimizer)
 
@@ -410,6 +447,7 @@ class DistributedCheckpointer(CheckpointerBase):
         storage_writer: Optional[FileSystemWriter] = None,
         trainable_only: bool = False,
         save_to_lowest_rank: bool = False,
+        parallel_state=None,
     ) -> None:
         """
         save training state to distributed checkpoint
@@ -447,9 +485,13 @@ class DistributedCheckpointer(CheckpointerBase):
         # saving extra_state first to gurantee that every saved model/optimizer ckpts have their extra_state saved before them
         cls._save_extra_state(checkpoint_dir=checkpoint_dir, state=state)
 
-        save_state = {"model": ModelState(state["model"], trainable_only=trainable_only)}
+        save_state = {
+            "model": ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
+        }
         if "optimizer" in state:
-            save_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])
+            save_state["optimizer"] = OptimizerState(
+                model=state["model"], optimizer=state["optimizer"], parallel_state=parallel_state
+            )
 
         if storage_writer is None:
             storage_writer = cls._create_storage_writer(checkpoint_dir)
@@ -471,6 +513,7 @@ class DistributedCheckpointer(CheckpointerBase):
         process_group=None,
         storage_reader: Optional[FileSystemReader] = None,
         trainable_only: bool = False,
+        parallel_state=None,
     ) -> Dict[str, Any]:
         """
         load training state from distributed checkpoint
@@ -496,9 +539,13 @@ class DistributedCheckpointer(CheckpointerBase):
         if "model" not in state:
             raise ValueError("Model must be provided to load a distributed checkpoint.")
 
-        load_state = {"model": ModelState(state["model"], trainable_only=trainable_only)}
+        load_state = {
+            "model": ModelState(state["model"], trainable_only=trainable_only, parallel_state=parallel_state)
+        }
         if "optimizer" in state:
-            load_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])  # type: ignore[index]
+            load_state["optimizer"] = OptimizerState(
+                model=state["model"], optimizer=state["optimizer"], parallel_state=parallel_state
+            )  # type: ignore[index]
 
         if storage_reader is None:
             storage_reader = cls._create_storage_reader(checkpoint_dir)
@@ -507,7 +554,7 @@ class DistributedCheckpointer(CheckpointerBase):
             state_dict=load_state,
             storage_reader=storage_reader,
             process_group=process_group,
-            planner=DefaultLoadPlanner(allow_partial_load=True),
+            planner=_ModelStrictLoadPlanner(strict_model=not trainable_only),
         )
 
         cls._load_extra_state(checkpoint_dir=checkpoint_dir, state=state)
@@ -632,18 +679,7 @@ class DistributedCheckpointer(CheckpointerBase):
 
 def get_dtype_size(dtype: torch.dtype) -> int:
     """Return size in bytes for a given dtype."""
-    size_map = {
-        torch.float32: 4,
-        torch.float16: 2,
-        torch.bfloat16: 2,
-        torch.int64: 8,
-        torch.int32: 4,
-        torch.int16: 2,
-        torch.int8: 1,
-        torch.uint8: 1,
-        torch.bool: 1,
-    }
-    return size_map.get(dtype, 4)
+    return torch.empty((), dtype=dtype).element_size()
 
 
 def _normalize_key(key: str) -> Optional[str]:
@@ -711,14 +747,15 @@ def _get_sharding_plan(
         hf_key = _normalize_key(key)
         if hf_key:
             # Determine dtype for size calculation
-            if save_dtype:
+            if not hasattr(tensor_meta.properties, "dtype"):
+                raise ValueError(
+                    f"Cannot determine dtype for tensor '{key}': metadata does not contain dtype information"
+                )
+            source_dtype = tensor_meta.properties.dtype
+            if save_dtype and source_dtype.is_floating_point:
                 dtype = getattr(torch, save_dtype) if isinstance(save_dtype, str) else save_dtype
             else:
-                if not hasattr(tensor_meta.properties, "dtype"):
-                    raise ValueError(
-                        f"Cannot determine dtype for tensor '{key}': metadata does not contain dtype information"
-                    )
-                dtype = tensor_meta.properties.dtype
+                dtype = source_dtype
 
             # Calculate tensor size in bytes
             numel = 1
@@ -802,7 +839,7 @@ def _process_shard(
         if hasattr(tensor, "full_tensor"):
             tensor = tensor.full_tensor()
 
-        if target_dtype:
+        if target_dtype and tensor.is_floating_point():
             tensor = tensor.to(dtype=target_dtype)
 
         # Explicitly move to CPU and detach to avoid memory retention

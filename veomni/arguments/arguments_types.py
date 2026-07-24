@@ -32,7 +32,10 @@ logger = logging.get_logger(__name__)
 #   ├── optimizer.*          → OptimizerConfig
 #   ├── wandb.*              → WandbConfig
 #   ├── profile.*            → ProfileConfig
+#   ├── channel_loss.*       → ChannelLossConfig
 #   ├── gradient_checkpointing.*  → GradientCheckpointingConfig
+#   ├── torch_compile.*      → TorchCompileConfig
+#   ├── chunk_mbs_config.*   → ChunkMBSConfig
 #   ├── accelerator.*        → AcceleratorConfig
 #   │   ├── fsdp_config.*    → FSDPConfig
 #   │   |   └── mixed_precision.* → MixedPrecisionConfig
@@ -95,12 +98,14 @@ class OptimizerConfig:
         metadata={"help": "Clip value for gradient norm."},
     )
     # ---- Muon-specific (only consulted when type == "muon") ---------------
-    muon_lr: float = field(
-        default=2e-2,
+    muon_lr: Optional[float] = field(
+        default=None,
         metadata={
             "help": (
                 "Learning rate for the Muon group (2D hidden weights and 3D expert stacks). "
-                "Per Moonlight, ~25x the AdamW lr is a common starting point."
+                "If unset: inherits train.optimizer.lr when muon_adjust_lr_fn=match_rms_adamw "
+                "(default); uses 25x train.optimizer.lr when muon_adjust_lr_fn=original "
+                "(Moonlight-style starting point)."
             )
         },
     )
@@ -145,6 +150,28 @@ class OptimizerConfig:
                 "Use whole-expert Shard(0) for Muon under FSDP+ExtraParallel when "
                 "(num_experts/ep_size) %% ep_fsdp_size == 0; otherwise fall back "
                 "to the default hidden-dim sharding path."
+            )
+        },
+    )
+    muon_ns_implementation: Literal["std", "gram", "gram_quack"] = field(
+        default="gram_quack",
+        metadata={
+            "help": (
+                "Newton-Schulz implementation used by Muon. "
+                "'std': torch.optim.Muon-compatible Newton-Schulz; "
+                "'gram': pure-PyTorch Dao-AILab Gram Newton-Schulz; "
+                "'gram_quack' (default): Dao-AILab Gram-NS with quack CuTeDSL GEMM kernels "
+                "(Hopper/Blackwell). If quack/package is missing, falls back to gram."
+            )
+        },
+    )
+    muon_gram_ns_reset_iterations: List[int] = field(
+        default_factory=lambda: [2],
+        metadata={
+            "help": (
+                "Restart indices for Gram Newton-Schulz (applied immediately before "
+                "those iteration indices). Default [2] matches Dao-AILab guidance "
+                "for 5-step schedules."
             )
         },
     )
@@ -217,6 +244,91 @@ class ProfileConfig:
 
 
 @dataclass
+class ChannelLossConfig:
+    """train.channel_loss.* — Per-channel causal-LM loss logging."""
+
+    enable: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable detached per-channel cross-entropy logging. This is an observability-only "
+                "side channel and does not change the training objective."
+            )
+        },
+    )
+    interval: int = field(
+        default=10,
+        metadata={
+            "help": (
+                "Compute and log channel loss every N optimizer steps. The detached fused-loss "
+                "fallback recomputes the LM-head projection on sampled steps; use 1 to sample every step."
+            )
+        },
+    )
+    source_id_keys: List[str] = field(
+        default_factory=lambda: ["channel_id", "source_id", "dataset_id", "ds_idx"],
+        metadata={
+            "help": (
+                "Batch metadata keys to read as channel/source IDs. The first key found in each "
+                "micro-batch is used. Values should be one per packed sequence."
+            )
+        },
+    )
+    source_name_keys: List[str] = field(
+        default_factory=lambda: ["channel_name", "source_name", "dataset_name", "data_name"],
+        metadata={
+            "help": (
+                "Batch metadata keys to read as display names for channel/source IDs. Values should "
+                "align with source_id_keys when provided."
+            )
+        },
+    )
+    extra_strip_keys: List[str] = field(
+        default_factory=lambda: ["cur_token_num"],
+        metadata={
+            "help": (
+                "Extra metadata keys to remove from each micro-batch before model forward when "
+                "channel loss is enabled."
+            )
+        },
+    )
+    loss_metric_prefix: str = field(
+        default="channel_loss",
+        metadata={"help": "Metric prefix for per-channel average CE."},
+    )
+    weighted_loss_metric_prefix: str = field(
+        default="channel_loss_weighted",
+        metadata={"help": "Metric prefix for per-channel CE weighted by all logged tokens in the step."},
+    )
+    token_count_metric_prefix: str = field(
+        default="channel_tokens",
+        metadata={"help": "Metric prefix for per-channel supervised token counts."},
+    )
+    log_weighted_loss: bool = field(
+        default=True,
+        metadata={"help": "Log loss_sum / total_step_tokens for each channel."},
+    )
+    log_token_count: bool = field(
+        default=True,
+        metadata={"help": "Log supervised token count for each channel."},
+    )
+    strict: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Raise when enabled but a micro-batch has no configured source ID, or when "
+                "source metadata cannot be aligned with packed segments. Default False skips "
+                "micro-batches with missing or mismatched metadata."
+            )
+        },
+    )
+
+    def __post_init__(self) -> None:
+        if self.interval < 1:
+            raise ValueError("train.channel_loss.interval must be at least 1.")
+
+
+@dataclass
 class GradientCheckpointingConfig:
     """train.gradient_checkpointing.* — Activation recomputation settings."""
 
@@ -233,6 +345,29 @@ class GradientCheckpointingConfig:
     enable_reentrant: bool = field(
         default=False,
         metadata={"help": "Use reentrant gradient checkpointing."},
+    )
+    early_stop: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Stop non-reentrant checkpoint recomputation as soon as all needed tensors are computed. "
+                "PyTorch ignores this option when enable_reentrant=True."
+            )
+        },
+    )
+
+
+@dataclass
+class ChunkMBSConfig:
+    """train.chunk_mbs_config.* — Packed-sequence layer micro-batching."""
+
+    enable: bool = field(
+        default=False,
+        metadata={"help": "Enable ChunkMBS for packed-sequence decoder layers."},
+    )
+    chunk_mbs: int = field(
+        default=1,
+        metadata={"help": "Number of packed samples per layer chunk."},
     )
 
 
@@ -605,8 +740,10 @@ class TrainingArguments:
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
     profile: ProfileConfig = field(default_factory=ProfileConfig)
+    channel_loss: ChannelLossConfig = field(default_factory=ChannelLossConfig)
     gradient_checkpointing: GradientCheckpointingConfig = field(default_factory=GradientCheckpointingConfig)
     torch_compile: TorchCompileConfig = field(default_factory=TorchCompileConfig)
+    chunk_mbs_config: ChunkMBSConfig = field(default_factory=ChunkMBSConfig)
     accelerator: AcceleratorConfig = field(default_factory=AcceleratorConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
@@ -615,6 +752,8 @@ class TrainingArguments:
             raise ValueError(
                 f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."
             )
+        if self.chunk_mbs_config.chunk_mbs < 1:
+            raise ValueError(f"chunk_mbs_config.chunk_mbs must be >= 1, got {self.chunk_mbs_config.chunk_mbs}.")
 
         self._train_steps = -1
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
@@ -770,10 +909,9 @@ class TrainingArguments:
 # always allowed implicitly. A value not in ``_NPU_ALLOWED[field]`` raises on
 # NPU; a value in ``_NPU_REQUIRED[field]`` raises off NPU.
 #
-# Hardcoded (not inferred from ``BackendSpec.requires``) because the name
-# ``"triton"`` is reused with different hardware semantics — NPU
-# triton-ascend for load-balancing loss vs. CUDA-only mainline triton for
-# DeepSeek-V3 RMSNorm / RoPE.
+# Hardcoded (not inferred from ``BackendSpec.requires``) because backend names
+# alone do not capture per-model and per-hardware compatibility. The NPU
+# default-normalization step runs before this allow-list validation.
 _NPU_ALLOWED: Dict[str, frozenset] = {
     "rms_norm_implementation": frozenset({"npu"}),
     "rotary_pos_emb_implementation": frozenset({"npu"}),
@@ -807,17 +945,20 @@ _NPU_DEFAULT_FALLBACK: Dict[str, str] = {
 class OpsImplementationConfig:
     """model.ops_implementation.* — kernel backend selection per op.
 
-    Defaults are GPU-optimal (Liger / Triton / fused_triton); they raise on
-    NPU. NPU users must pin every per-op field to an NPU-supported value, or
-    ``"eager"`` when the op has no NPU kernel. Per-op fields are ``str`` so
-    third-party backends can register without changing this dataclass.
+    Defaults are GPU-optimal (Liger / Triton / fused_triton). On NPU, values
+    still equal to the dataclass defaults listed in ``_NPU_DEFAULT_FALLBACK``
+    are automatically mapped to NPU-compatible or eager implementations;
+    explicit non-default overrides are validated and unsupported values raise.
+    Per-op fields are ``str`` so third-party backends can register without
+    changing this dataclass.
 
     NPU validation runs at two times:
 
     - **Config-parse time** (``__post_init__``) for ops registered in the
       legacy per-model registry: ``rms_norm``, ``rotary_pos_emb``,
-      ``swiglu_mlp``, ``load_balancing_loss``, plus ``cross_entropy_loss``
-      and ``moe``. Errors fire immediately with a model-agnostic allow-list.
+      ``rotary_pos_emb_vision``, ``swiglu_mlp``, ``load_balancing_loss``, plus
+      ``cross_entropy_loss`` and ``moe``. Errors fire immediately with a
+      model-agnostic allow-list.
     - **Model-build time** (``OpSlot.bind`` via ``KERNEL_REGISTRY.resolve``)
       for Qwen3.5-only ops: ``rms_norm_gated``, ``causal_conv1d``,
       ``chunk_gated_delta_rule``. These OpSlots only exist in Qwen3.5's
@@ -830,7 +971,9 @@ class OpsImplementationConfig:
 
     Backends: ``"eager"`` (HF reference, always available),
     ``"liger_kernel"`` (GPU, needs ``liger-kernel``), ``"npu"`` (Ascend),
-    ``"triton"`` (CUDA ``triton`` / NPU ``triton-ascend``).
+    ``"triton"`` (CUDA ``triton``). Load-balancing loss has a CUDA Triton
+    backend; on NPU, values equal to the dataclass default are normalized to
+    ``"eager"`` before registry binding.
     """
 
     attn_implementation: Optional[
@@ -851,7 +994,8 @@ class OpsImplementationConfig:
         metadata={
             "help": "MoE experts forward. 'fused_triton' (default, GPU SM70+) | "
             "'fused_quack' (GPU SM90+) | 'fused_npu' (NPU) | 'eager'. "
-            "Hardware mismatch raises at config validation. Legacy 'fused' "
+            "On NPU, a default-valued 'fused_triton' selection maps to 'fused_npu'; "
+            "incompatible non-default overrides raise. Legacy 'fused' "
             "auto-resolves to fused_quack/fused_npu with a deprecation warning."
         },
     )
@@ -892,8 +1036,8 @@ class OpsImplementationConfig:
     load_balancing_loss_implementation: str = field(
         default="triton",
         metadata={
-            "help": "MoE load-balancing loss. 'triton' (default; needs 'triton' on CUDA "
-            "or 'triton-ascend' on NPU — raises at validation if missing) | 'eager'."
+            "help": "MoE load-balancing loss. 'triton' (default; needs 'triton' on CUDA) | 'eager'. "
+            "On NPU, config normalization maps the default 'triton' value to 'eager'."
         },
     )
     rms_norm_gated_implementation: str = field(
@@ -930,13 +1074,20 @@ class OpsImplementationConfig:
             "A non-eager value on hardware without a matching backend raises at OpSlot bind time."
         },
     )
-    dsa_indexer_backend: Literal["eager", "cudnn"] = field(
+    dsa_indexer_implementation: Literal["eager", "cudnn", "tilelang"] = field(
         default="eager",
-        metadata={"help": "DeepSeek sparse attention top-k indexer backend."},
+        metadata={"help": "DeepSeek sparse attention top-k indexer implementation: 'eager', 'cudnn', or 'tilelang'."},
     )
-    dsa_attention_backend: Literal["eager", "flashmla_cudnn"] = field(
+    dsa_attention_implementation: Literal["eager", "flashmla_cudnn", "tilelang"] = field(
         default="eager",
-        metadata={"help": "DeepSeek sparse attention backend."},
+        metadata={"help": "DeepSeek sparse attention implementation: 'eager', 'flashmla_cudnn', or 'tilelang'."},
+    )
+    mhc_implementation: Literal["eager", "tilelang"] = field(
+        default="eager",
+        metadata={
+            "help": "Manifold-constrained Hyper-Connection implementation. 'tilelang' enables the "
+            "DeepSeek V4 TileKernels forward/backward path on NVIDIA SM90+; 'eager' uses PyTorch."
+        },
     )
 
     def __post_init__(self):
@@ -971,7 +1122,7 @@ class OpsImplementationConfig:
     def _apply_npu_default_fallback(self):
         """Auto-resolve GPU-only defaults to NPU-compatible alternatives.
 
-        When running on NPU, fields still at their GPU default are silently
+        When running on NPU, fields still at their GPU default are automatically
         swapped to the NPU fallback from ``_NPU_DEFAULT_FALLBACK``. Explicit
         user overrides (non-default values) are left untouched and will be
         caught by ``_validate_implementations`` if unsupported.
@@ -1036,7 +1187,7 @@ class OpsImplementationConfig:
         if self.load_balancing_loss_implementation == "triton" and not is_package_available("triton"):
             raise ValueError(
                 "load_balancing_loss_implementation='triton' requires the 'triton' package "
-                "(or 'triton-ascend' on NPU). Install it or set the field to 'eager'."
+                "on CUDA. Install it or set the field to 'eager'."
             )
 
 
@@ -1304,7 +1455,23 @@ class VeOmniArguments:
                 self.train.pad_to_length = self.train.micro_batch_size * self.data.max_seq_len
                 logger.info_rank0(f"set pad_to_length = micro_batch_size * max_seq_len = {self.train.pad_to_length}")
 
+        if self.train.chunk_mbs_config.enable:
+            if self.train.pad_to_length:
+                raise ValueError("train.chunk_mbs_config.enable is not supported with train.pad_to_length yet.")
+            if self.train.gradient_checkpointing.enable and self.train.gradient_checkpointing.enable_reentrant:
+                raise ValueError(
+                    "train.chunk_mbs_config.enable requires non-reentrant gradient checkpointing. "
+                    "Set train.gradient_checkpointing.enable_reentrant=False."
+                )
+            if self.data.data_type == "dpo":
+                raise ValueError("train.chunk_mbs_config.enable is not supported by the DPO trainer yet.")
+
         if self.train.torch_compile.enable:
+            if self.train.chunk_mbs_config.enable:
+                raise ValueError(
+                    "train.chunk_mbs_config.enable is not supported with train.torch_compile.enable yet. "
+                    "ChunkMBS wraps decoder forwards with per-batch chunk ranges before decoder blocks are compiled."
+                )
             if not getattr(self.data, "supports_torch_compile", True):
                 raise ValueError(
                     "train.torch_compile.enable currently supports text trainers only. "
